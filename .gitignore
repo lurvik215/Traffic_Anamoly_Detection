@@ -1,0 +1,16 @@
+# datasets
+data/
+
+# models
+models/*.pt
+
+# results
+results/
+
+# videos
+videos/
+
+# cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints
