@@ -10,8 +10,8 @@ from ultralytics import YOLO
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MODEL_PATH = os.path.join(BASE_DIR, "models", "helmet_detector.pt")
-VIDEO_PATH = os.path.join(BASE_DIR, "data","videos", "traffic_video.mp4")
-OUTPUT_PATH = os.path.join(BASE_DIR, "results", "helmet_output.mp4")
+VIDEO_PATH = os.path.join(BASE_DIR, "data","videos", "traffic3.mp4")
+OUTPUT_PATH = os.path.join(BASE_DIR, "results", "helmet_output3.mp4")
 
 
 # ---------------------------------------------------

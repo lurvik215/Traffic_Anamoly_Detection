@@ -2,7 +2,8 @@ import os
 import sys
 import cv2
 import numpy as np
-import supervision as sv
+
+from deep_sort_realtime.deepsort_tracker import DeepSort
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
@@ -11,24 +12,21 @@ from scripts.vehicle_detection import VehicleDetector
 from scripts.helmet_detection import HelmetDetector
 
 
-# ---------------- PATHS ----------------
-
+# -------- PATHS --------
 VEHICLE_MODEL = os.path.join(BASE_DIR, "models/vehicle_detector.pt")
 HELMET_MODEL  = os.path.join(BASE_DIR, "models/helmet_detector.pt")
 
-VIDEO_PATH  = os.path.join(BASE_DIR, "data/videos/traffic_video.mp4")
-OUTPUT_PATH = os.path.join(BASE_DIR, "results/output_tracked.mp4")
+VIDEO_PATH  = os.path.join(BASE_DIR, "data/videos/traffic2.mp4")
+OUTPUT_PATH = os.path.join(BASE_DIR, "results/output_deepsort.mp4")
 
 
-# ---------------- COLORS ----------------
-
+# -------- COLORS --------
 BLUE  = (255,0,0)
 GREEN = (0,255,0)
 RED   = (0,0,255)
 
 
-# ---------------- IOU ----------------
-
+# -------- IOU --------
 def compute_iou(box1, box2):
 
     x1 = max(box1[0], box2[0])
@@ -49,8 +47,7 @@ def compute_iou(box1, box2):
     return inter/union
 
 
-# ---------------- PIPELINE ----------------
-
+# -------- MAIN --------
 def run_pipeline():
 
     print("Loading models...")
@@ -58,7 +55,11 @@ def run_pipeline():
     vehicle_detector = VehicleDetector(VEHICLE_MODEL)
     helmet_detector  = HelmetDetector(HELMET_MODEL)
 
-    tracker = sv.ByteTrack()
+    tracker = DeepSort(
+        max_age=30,
+        n_init=3,
+        max_cosine_distance=0.4
+    )
 
     cap = cv2.VideoCapture(VIDEO_PATH)
 
@@ -76,6 +77,7 @@ def run_pipeline():
     )
 
     violation_ids = set()
+    track_history = {}
 
     while True:
 
@@ -85,7 +87,7 @@ def run_pipeline():
             break
 
 
-        # ---------------- VEHICLE DETECTION ----------------
+        # -------- VEHICLE DETECTION --------
 
         detections = vehicle_detector.detect(frame)
 
@@ -94,32 +96,25 @@ def run_pipeline():
 
         for det in detections:
 
+            if det["confidence"] < 0.5:
+                continue
+
             cls = det["class_name"].lower()
             x1,y1,x2,y2 = det["bbox"]
-            conf = det["confidence"]
-
-            box = (x1,y1,x2,y2)
 
             if "two" in cls:
-                two_wheelers.append(box)
+                two_wheelers.append((x1,y1,x2,y2))
 
             elif "person" in cls:
-                persons.append(box)
+                persons.append((x1,y1,x2,y2))
 
             else:
-
-                label = f"{cls} {conf:.2f}"
-
                 cv2.rectangle(frame,(x1,y1),(x2,y2),BLUE,2)
-
-                cv2.putText(frame,label,(x1,y1-10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            BLUE,
-                            2)
+                cv2.putText(frame,cls,(x1,y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.5,BLUE,2)
 
 
-        # ---------------- CREATE RIDERS ----------------
+        # -------- CREATE RIDERS --------
 
         rider_boxes = []
         used_person = set()
@@ -131,7 +126,7 @@ def run_pipeline():
                 if i in used_person:
                     continue
 
-                if compute_iou(tw,p) > 0.1:
+                if compute_iou(tw,p) > 0.2:
 
                     px1,py1,px2,py2 = p
                     tx1,ty1,tx2,ty2 = tw
@@ -144,108 +139,100 @@ def run_pipeline():
                     )
 
                     rider_boxes.append(rider)
-
                     used_person.add(i)
-
                     break
 
 
-        # ---------------- TRACKING ----------------
+        # -------- DEEPSORT INPUT --------
 
-        if len(rider_boxes) > 0:
+        ds_detections = []
 
-            boxes = np.array(rider_boxes)
+        for box in rider_boxes:
 
-            detections_sv = sv.Detections(
-                xyxy = boxes,
-                confidence = np.ones(len(boxes)),
-                class_id = np.zeros(len(boxes))
-            )
+            x1,y1,x2,y2 = box
+            w = x2 - x1
+            h = y2 - y1
 
-            tracks = tracker.update_with_detections(detections_sv)
-
-        else:
-
-            tracks = sv.Detections.empty()
+            ds_detections.append(([x1,y1,w,h], 0.9, "rider"))
 
 
-        if tracks.tracker_id is None:
-            continue
+        tracks = tracker.update_tracks(ds_detections, frame=frame)
 
 
-        # ---------------- PROCESS TRACKED RIDERS ----------------
+        # -------- PROCESS TRACKS --------
 
-        for box, track_id in zip(tracks.xyxy, tracks.tracker_id):
+        for track in tracks:
 
-            x1,y1,x2,y2 = map(int, box)
-            track_id = int(track_id)
-
-            cv2.rectangle(frame,(x1,y1),(x2,y2),BLUE,2)
-
-            cv2.putText(frame,
-                        f"Rider {track_id}",
-                        (x1,y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        BLUE,
-                        2)
-
-            rider_crop = frame[y1:y2, x1:x2]
-
-            if rider_crop.size == 0:
+            if not track.is_confirmed():
                 continue
 
+            track_id = track.track_id
 
-            # ---------------- HELMET DETECTION ----------------
+            l,t,r,b = map(int, track.to_ltrb())
 
-            helmet_dets = helmet_detector.detect(rider_crop)
+
+            # -------- SMOOTHING --------
+
+            if track_id in track_history:
+
+                px1,py1,px2,py2 = track_history[track_id]
+
+                l = int(0.7*px1 + 0.3*l)
+                t = int(0.7*py1 + 0.3*t)
+                r = int(0.7*px2 + 0.3*r)
+                b = int(0.7*py2 + 0.3*b)
+
+            track_history[track_id] = (l,t,r,b)
+
+
+            cv2.rectangle(frame,(l,t),(r,b),BLUE,2)
+            cv2.putText(frame,f"Rider {track_id}",(l,t-10),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.6,BLUE,2)
+
+
+            # -------- HELMET DETECTION --------
+
+            crop = frame[t:b, l:r]
+
+            if crop.size == 0:
+                continue
+
+            helmet_dets = helmet_detector.detect(crop)
 
             for det in helmet_dets:
 
                 cls = det["class_name"].lower()
-
                 hx1,hy1,hx2,hy2 = det["bbox"]
-                conf = det["confidence"]
 
-                hx1 += x1
-                hy1 += y1
-                hx2 += x1
-                hy2 += y1
+                hx1 += l
+                hy1 += t
+                hx2 += l
+                hy2 += t
 
 
-                if "goodhelmet" in cls:
+                if "good" in cls:
 
                     color = GREEN
-                    label = "goodhelmet"
 
-                elif "badhelmet" in cls or "nohelmet" in cls:
+                elif "bad" in cls or "no" in cls:
 
                     color = RED
-                    label = cls
-
                     violation_ids.add(track_id)
 
                 else:
 
                     color = BLUE
-                    label = cls
 
 
                 cv2.rectangle(frame,(hx1,hy1),(hx2,hy2),color,2)
-
-                cv2.putText(frame,
-                            label,
-                            (hx1,hy1-10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            color,
-                            2)
+                cv2.putText(frame,cls,(hx1,hy1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.5,color,2)
 
 
-        # ---------------- VIOLATION COUNTER ----------------
+        # -------- COUNTER --------
 
         cv2.putText(frame,
-                    f"Helmet Violations: {len(violation_ids)}",
+                    f"Violations: {len(violation_ids)}",
                     (30,40),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,
@@ -254,8 +241,7 @@ def run_pipeline():
 
 
         out.write(frame)
-
-        cv2.imshow("Traffic Monitoring", frame)
+        cv2.imshow("DeepSORT Pipeline", frame)
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
@@ -265,11 +251,8 @@ def run_pipeline():
     out.release()
     cv2.destroyAllWindows()
 
-    print("Output saved to:", OUTPUT_PATH)
+    print("Saved:", OUTPUT_PATH)
 
-
-# ---------------- RUN ----------------
 
 if __name__ == "__main__":
-
     run_pipeline()

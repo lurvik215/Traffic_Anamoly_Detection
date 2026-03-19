@@ -7,3 +7,4 @@ torch
 torchvision
 jupyter
 supervision
+deep_sort_realtime
